@@ -45,7 +45,6 @@ func init() {
 func (s3 *S3) Provision(context caddy.Context) error {
 	s3.Logger = context.Logger(s3)
 
-	// runningEnvironment := os.GetEnvWithDefaults("RUNNING_ENVIRONMENT", "PROD")
 	runningEnvironment := os.Getenv("RUNNING_ENVIRONMENT")
 	if len(runningEnvironment) == 0 {
 		runningEnvironment = "PROD"
@@ -64,16 +63,36 @@ func (s3 *S3) Provision(context caddy.Context) error {
 
 	s3.Client = client
 
-	// Redis Client
-	s3.RedisClient = redis.NewClient(&redis.Options{
-		Network:  "tcp",
-		Addr:     s3.RedisAddress,
-		Password: s3.RedisPassword,
-		DB:       s3.RedisDB,
-	})
+	for {
+		// Redis Client
+		s3.RedisClient = redis.NewClient(&redis.Options{
+			Network:         "tcp",
+			Addr:            s3.RedisAddress,
+			Password:        s3.RedisPassword,
+			DB:              s3.RedisDB,
+			MaxRetries:      10,
+			MinRetryBackoff: 500 * time.Millisecond,
+			MaxRetryBackoff: 2 * time.Second,
+		})
+		err := ping(s3.RedisClient)
+		if err != nil {
+			break
+		}
+		fmt.Println("Sleeping for 10 seconds to try again")
+		time.Sleep(10 * time.Second)
+	}
+
 	s3.RedisLocker = redislock.New(s3.RedisClient)
 	s3.RedisLocks = make(map[string]*redislock.Lock)
 
+	return nil
+}
+
+func ping(client *redis.Client) error {
+	_, err := client.Ping(context.TODO()).Result()
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
