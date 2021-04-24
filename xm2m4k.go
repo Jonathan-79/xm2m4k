@@ -78,6 +78,7 @@ func (s3 *S3) Provision(context caddy.Context) error {
 		if err == nil {
 			break
 		}
+		fmt.Println("Still waiting for redis to be available")
 		fmt.Println("Sleeping for 10 seconds to try again")
 		time.Sleep(10 * time.Second)
 	}
@@ -89,7 +90,7 @@ func (s3 *S3) Provision(context caddy.Context) error {
 }
 
 func ping(client *redis.Client) error {
-	_, err := client.Ping(context.TODO()).Result()
+	err := client.Ping(context.TODO()).Err()
 	if err != nil {
 		return err
 	}
