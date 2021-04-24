@@ -75,7 +75,7 @@ func (s3 *S3) Provision(context caddy.Context) error {
 			MaxRetryBackoff: 2 * time.Second,
 		})
 		err := ping(s3.RedisClient)
-		if err != nil {
+		if err == nil {
 			break
 		}
 		fmt.Println("Sleeping for 10 seconds to try again")
