@@ -3,44 +3,224 @@ package xm2m4k
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"io/ioutil"
-	"os"
-	"strconv"
 	"strings"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
-	"github.com/minio/minio-go/v7"
+	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"go.uber.org/zap"
 )
 
 type S3 struct {
-	logger *zap.Logger
+	Logger *zap.Logger
 
 	// S3
-	Client         *minio.Client
-	Host           string `json:"host"`
-	Bucket         string `json:"bucket"`
-	AccessID       string `json:"access_id"`
-	SecretKey      string `json:"secret_key"`
-	Prefix         string `json:"prefix"`
-	Insecure       bool   `json:"insecure"`
-	UseIamProvider bool   `json:"use_iam_provider"`
+	Client    *minio.Client
+	Host      string `json:"host"`
+	Bucket    string `json:"bucket"`
+	AccessKey string `json:"access_key"`
+	SecretKey string `json:"secret_key"`
+	Prefix    string `json:"prefix"`
+
+	// EncryptionKey is optional. If you do not wish to encrypt your certficates and key inside the S3 bucket, leave it empty.
+	EncryptionKey string `json:"encryption_key"`
+
+	iowrap IO
 }
 
 func init() {
-	caddy.RegisterModule(S3{})
+	caddy.RegisterModule(new(S3))
+}
+
+func (s3 *S3) Provision(context caddy.Context) error {
+	s3.Logger = context.Logger(s3)
+
+	// S3 Client
+	client, err := minio.New(s3.Host, &minio.Options{
+		Creds:  credentials.NewStaticV4(s3.AccessKey, s3.SecretKey, ""),
+		Secure: true,
+	})
+
+	if err != nil {
+		return err
+	}
+
+	s3.Client = client
+
+	if len(s3.EncryptionKey) == 0 {
+		s3.Logger.Info("Clear text certificate storage active")
+		s3.iowrap = &CleartextIO{}
+	} else if len(s3.EncryptionKey) != 32 {
+		s3.Logger.Error("encryption key must have exactly 32 bytes")
+		return errors.New("encryption key must have exactly 32 bytes")
+	} else {
+		s3.Logger.Info("Encrypted certificate storage active")
+		sb := &SecretBoxIO{}
+		copy(sb.SecretKey[:], []byte(s3.EncryptionKey))
+		s3.iowrap = sb
+	}
+
+	return nil
+}
+
+func (s3 *S3) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID: "caddy.storage.s3",
+		New: func() caddy.Module {
+			return new(S3)
+		},
+	}
+}
+
+var (
+	LockExpiration   = 2 * time.Minute
+	LockPollInterval = 1 * time.Second
+	LockTimeout      = 15 * time.Second
+)
+
+func (s3 *S3) Lock(ctx context.Context, key string) error {
+	s3.Logger.Info(fmt.Sprintf("Lock: %v", s3.objName(key)))
+	var startedAt = time.Now()
+
+	for {
+		obj, err := s3.Client.GetObject(ctx, s3.Bucket, s3.objLockName(key), minio.GetObjectOptions{})
+		if err == nil {
+			return s3.putLockFile(ctx, key)
+		}
+		buf, err := ioutil.ReadAll(obj)
+		if err != nil {
+			// Retry
+			continue
+		}
+		lt, err := time.Parse(time.RFC3339, string(buf))
+		if err != nil {
+			// Lock file does not make sense, overwrite.
+			return s3.putLockFile(ctx, key)
+		}
+		if lt.Add(LockTimeout).Before(time.Now()) {
+			// Existing lock file expired, overwrite.
+			return s3.putLockFile(ctx, key)
+		}
+
+		if startedAt.Add(LockTimeout).Before(time.Now()) {
+			return errors.New("acquiring lock failed")
+		}
+		time.Sleep(LockPollInterval)
+	}
+}
+
+func (s3 *S3) putLockFile(ctx context.Context, key string) error {
+	// Object does not exist, we're creating a lock file.
+	r := bytes.NewReader([]byte(time.Now().Format(time.RFC3339)))
+	_, err := s3.Client.PutObject(ctx, s3.Bucket, s3.objLockName(key), r, int64(r.Len()), minio.PutObjectOptions{})
+	return err
+}
+
+func (s3 *S3) Unlock(ctx context.Context, key string) error {
+	s3.Logger.Info(fmt.Sprintf("Release lock: %v", s3.objName(key)))
+	return s3.Client.RemoveObject(ctx, s3.Bucket, s3.objLockName(key), minio.RemoveObjectOptions{})
+}
+
+func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
+	r := s3.iowrap.ByteReader(value)
+	s3.Logger.Info(fmt.Sprintf("Store: %v, %v bytes", s3.objName(key), len(value)))
+	_, err := s3.Client.PutObject(ctx,
+		s3.Bucket,
+		s3.objName(key),
+		r,
+		int64(r.Len()),
+		minio.PutObjectOptions{},
+	)
+	return err
+}
+
+func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
+	s3.Logger.Info(fmt.Sprintf("Load: %v", s3.objName(key)))
+	r, err := s3.Client.GetObject(ctx, s3.Bucket, s3.objName(key), minio.GetObjectOptions{})
+	if err != nil {
+		if err.Error() == "The specified key does not exist." {
+			return nil, fs.ErrNotExist
+		}
+		return nil, err
+	} else if r != nil {
+		// AWS (at least) doesn't return an error on key doesn't exist. We have
+		// to examine the empty object returned.
+		_, err = r.Stat()
+		if err != nil {
+			er := minio.ToErrorResponse(err)
+			if er.StatusCode == 404 {
+				return nil, fs.ErrNotExist
+			}
+		}
+	}
+	defer r.Close()
+	buf, err := ioutil.ReadAll(s3.iowrap.WrapReader(r))
+	if err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func (s3 *S3) Delete(ctx context.Context, key string) error {
+	s3.Logger.Info(fmt.Sprintf("Delete: %v", s3.objName(key)))
+	return s3.Client.RemoveObject(ctx, s3.Bucket, s3.objName(key), minio.RemoveObjectOptions{})
+}
+
+func (s3 *S3) Exists(ctx context.Context, key string) bool {
+	s3.Logger.Info(fmt.Sprintf("Exists: %v", s3.objName(key)))
+	_, err := s3.Client.StatObject(ctx, s3.Bucket, s3.objName(key), minio.StatObjectOptions{})
+	return err == nil
+}
+
+func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
+	var keys []string
+	for obj := range s3.Client.ListObjects(ctx, s3.Bucket, minio.ListObjectsOptions{
+		Prefix:    s3.objName(""),
+		Recursive: true,
+	}) {
+		keys = append(keys, obj.Key)
+	}
+	return keys, nil
+}
+
+func (s3 *S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
+	s3.Logger.Info(fmt.Sprintf("Stat: %v", s3.objName(key)))
+	var ki certmagic.KeyInfo
+	oi, err := s3.Client.StatObject(ctx, s3.Bucket, s3.objName(key), minio.StatObjectOptions{})
+	if err != nil {
+		return ki, fs.ErrNotExist
+	}
+	ki.Key = key
+	ki.Size = oi.Size
+	ki.Modified = oi.LastModified
+	ki.IsTerminal = true
+	return ki, nil
+}
+
+func (s3 *S3) objName(key string) string {
+	return fmt.Sprintf("%s/%s", strings.TrimPrefix(s3.Prefix, "/"), strings.TrimPrefix(key, "/"))
+}
+
+func (s3 *S3) objLockName(key string) string {
+	return s3.objName(key) + ".lock"
+}
+
+// CertMagicStorage converts s to a certmagic.Storage instance.
+func (s3 *S3) CertMagicStorage() (certmagic.Storage, error) {
+	return s3, nil
 }
 
 func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
-		var value string
-
 		key := d.Val()
+		var value string
 
 		if !d.Args(&value) {
 			continue
@@ -51,208 +231,25 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			s3.Host = value
 		case "bucket":
 			s3.Bucket = value
-		case "access_id":
-			s3.AccessID = value
+		case "access_key":
+			s3.AccessKey = value
 		case "secret_key":
 			s3.SecretKey = value
 		case "prefix":
-			s3.Prefix = value
-		case "insecure":
-			insecure, err := strconv.ParseBool(value)
-			if err != nil {
-				return d.Err("Invalid usage of insecure in s3-storage config: " + err.Error())
+			if value != "" {
+				s3.Prefix = value
+			} else {
+				s3.Prefix = "acme"
 			}
-			s3.Insecure = insecure
-		case "use_iam_provider":
-			boolValue, err := strconv.ParseBool(value)
-			if err != nil {
-				return d.Err("Invalid usage of use_iam_provider in s3-storage config: " + err.Error())
-			}
-			s3.UseIamProvider = boolValue
-		}
-
-	}
-
-	return nil
-}
-
-func (s3 *S3) Provision(ctx caddy.Context) error {
-	s3.logger = ctx.Logger(s3)
-
-	// Load Environment
-	if s3.Host == "" {
-		s3.Host = os.Getenv("S3_HOST")
-	}
-
-	if s3.Bucket == "" {
-		s3.Bucket = os.Getenv("S3_BUCKET")
-	}
-
-	if s3.AccessID == "" {
-		s3.AccessID = os.Getenv("S3_ACCESS_ID")
-	}
-
-	if s3.SecretKey == "" {
-		s3.SecretKey = os.Getenv("S3_SECRET_KEY")
-	}
-
-	if s3.Prefix == "" {
-		s3.Prefix = os.Getenv("S3_PREFIX")
-	}
-
-	if !s3.Insecure {
-		insecure := os.Getenv("S3_INSECURE")
-		if insecure != "" {
-			s3.Insecure, _ = strconv.ParseBool(insecure)
+		case "encryption_key":
+			s3.EncryptionKey = value
 		}
 	}
-	secure := !s3.Insecure
-
-	if !s3.UseIamProvider {
-		boolVal := os.Getenv("S3_USE_IAM_PROVIDER")
-		if boolVal != "" {
-			s3.UseIamProvider, _ = strconv.ParseBool(boolVal)
-		}
-	}
-
-	var creds *credentials.Credentials
-	if s3.UseIamProvider {
-		s3.logger.Info("use iam aws provider for credentials")
-		creds = credentials.NewIAM("")
-	} else {
-		s3.logger.Info("use secret_key and access_id for credentials")
-		creds = credentials.NewStaticV4(s3.AccessID, s3.SecretKey, "")
-	}
-
-	// S3 Client
-	client, err := minio.New(s3.Host, &minio.Options{
-		Creds:  creds,
-		Secure: secure,
-	})
-
-	if err != nil {
-		return err
-	} else {
-		s3.Client = client
-	}
-
 	return nil
 }
 
-func (S3) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		ID: "caddy.storage.s3",
-		New: func() caddy.Module {
-			return new(S3)
-		},
-	}
-}
-
-func (s3 S3) CertMagicStorage() (certmagic.Storage, error) {
-	return s3, nil
-}
-
-func (s3 S3) Lock(ctx context.Context, key string) error {
-	return nil
-}
-
-func (s3 S3) Unlock(ctx context.Context, key string) error {
-	return nil
-}
-
-func (s3 S3) Store(ctx context.Context, key string, value []byte) error {
-	key = s3.KeyPrefix(key)
-	length := int64(len(value))
-
-	s3.logger.Debug(fmt.Sprintf("Store: %s, %d bytes", key, length))
-
-	_, err := s3.Client.PutObject(context.Background(), s3.Bucket, key, bytes.NewReader(value), length, minio.PutObjectOptions{})
-
-	return err
-}
-
-func (s3 S3) Load(ctx context.Context, key string) ([]byte, error) {
-	if !s3.Exists(ctx, key) {
-		return nil, fs.ErrNotExist
-	}
-
-	key = s3.KeyPrefix(key)
-
-	s3.logger.Debug(fmt.Sprintf("Load key: %s", key))
-
-	object, err := s3.Client.GetObject(context.Background(), s3.Bucket, key, minio.GetObjectOptions{})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return ioutil.ReadAll(object)
-}
-
-func (s3 S3) Delete(ctx context.Context, key string) error {
-	key = s3.KeyPrefix(key)
-
-	s3.logger.Debug(fmt.Sprintf("Delete key: %s", key))
-
-	return s3.Client.RemoveObject(context.Background(), s3.Bucket, key, minio.RemoveObjectOptions{})
-}
-
-func (s3 S3) Exists(ctx context.Context, key string) bool {
-	key = s3.KeyPrefix(key)
-
-	_, err := s3.Client.StatObject(context.Background(), s3.Bucket, key, minio.StatObjectOptions{})
-
-	exists := err == nil
-
-	s3.logger.Debug(fmt.Sprintf("Check exists: %s, %t", key, exists))
-
-	return exists
-}
-
-func (s3 S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	defer cancel()
-
-	objects := s3.Client.ListObjects(ctx, s3.Bucket, minio.ListObjectsOptions{
-		Prefix:    prefix,
-		Recursive: recursive,
-	})
-
-	keys := make([]string, len(objects))
-
-	for object := range objects {
-		keys = append(keys, object.Key)
-	}
-
-	return keys, nil
-}
-
-func (s3 S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
-	key = s3.KeyPrefix(key)
-
-	object, err := s3.Client.StatObject(context.Background(), s3.Bucket, key, minio.StatObjectOptions{})
-
-	if err != nil {
-		s3.logger.Error(fmt.Sprintf("Stat key: %s, error: %v", key, err))
-
-		return certmagic.KeyInfo{}, nil
-	}
-
-	s3.logger.Debug(fmt.Sprintf("Stat key: %s, size: %d bytes", key, object.Size))
-
-	return certmagic.KeyInfo{
-		Key:        object.Key,
-		Modified:   object.LastModified,
-		Size:       object.Size,
-		IsTerminal: strings.HasSuffix(object.Key, "/"),
-	}, err
-}
-
-func (s3 S3) KeyPrefix(key string) string {
-	return s3.Prefix + "/" + key
-}
-
-func (s3 S3) String() string {
-	return fmt.Sprintf("S3 Storage Host: %s, Bucket: %s, Prefix: %s", s3.Host, s3.Bucket, s3.Prefix)
-}
+var (
+	_ caddy.Provisioner      = (*S3)(nil)
+	_ caddy.StorageConverter = (*S3)(nil)
+	_ caddyfile.Unmarshaler  = (*S3)(nil)
+)
