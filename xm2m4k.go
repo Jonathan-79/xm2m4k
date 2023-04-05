@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"io/ioutil"
+	"os"
 	"strings"
 	"time"
 
@@ -42,10 +43,20 @@ func init() {
 func (s3 *S3) Provision(context caddy.Context) error {
 	s3.Logger = context.Logger(s3)
 
+	runningEnvironment := os.Getenv("RUNNING_ENVIRONMENT")
+	if len(runningEnvironment) == 0 {
+		runningEnvironment = "PROD"
+	}
+
+	useSSL := true
+	if runningEnvironment == "DEV" {
+		useSSL = false
+	}
+
 	// S3 Client
 	client, err := minio.New(s3.Host, &minio.Options{
 		Creds:  credentials.NewStaticV4(s3.AccessKey, s3.SecretKey, ""),
-		Secure: true,
+		Secure: useSSL,
 	})
 
 	if err != nil {
